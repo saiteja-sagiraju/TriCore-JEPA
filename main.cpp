@@ -51,7 +51,7 @@ int main() {
             float *dest_rgb = &X_spatial.data[i * (2 * d) + d];
 
             const float *src_thermal = &X_thermal.data[i * d];
-            const float *src_rgb = &X_thermal.data[i * d];
+            const float *src_rgb = &X_rgb.data[i * d];
 
             std::copy(src_thermal, src_thermal + d, dest_thermal);
             std::copy(src_rgb, src_rgb + d, dest_rgb);
@@ -97,25 +97,76 @@ int main() {
         }
 
         // softmax * V
-        Tensor Final_Out = matmul(Scores, V);
+        Tensor Final_Out = matmul(Scores, V); // (S, d) * (N, d) = (S, d)
 
         // --- LOSS CALCULATION ---
         int M = S * d;
+        float M_reciprocal = 1.0f / M;
         float loss = 0.0f;
 
+        Tensor d_Final_Out(S, d); // (S, d)
+
         for (size_t i = 0; i < M; ++i) {
-            loss += (Final_Out.data[i] - Target.data[i]) * 2;
+            loss += std::pow((Final_Out.data[i] - Target.data[i]), 2);
+            d_Final_Out.data[i] = (Final_Out.data[i] - Target.data[i]) * 2 * M_reciprocal;
         }
 
-        loss /= M;
+        loss *= M_reciprocal;
 
-        std::cout << loss << '\n';
+        std::cout << "EPOCH " << epoch + 1 << ": " <<  "LOSS: " << loss << '\n';
 
         // --- BACKWARD PASS ---
         // ... (Execute the gradient splits) ...
 
+        // splitting between softmax() and V
+
+        Tensor d_V = matmul(Scores, d_Final_Out, true, false); // (N, S) * (S, d) = (N, d)
+        Tensor d_Attn_Weights = matmul(d_Final_Out, V, false, true); // (S, d) * (d, N) = (S, N)
+
+        Tensor d_Scores(S, N); // Create gradient tensor for scores
+
+        for (size_t i = 0; i < S; ++i) {
+            const float *scores_row = &Scores.data[i * N];
+            const float *d_attn_row = &d_Attn_Weights.data[i * N];
+            float *d_scores_row = &d_Scores.data[i * N];
+
+            float dot_product = 0.0f;
+            for (size_t j = 0; j < N; ++j) {
+                dot_product += d_attn_row[j] * scores_row[j];
+            }
+
+            // Apply the Jacobian vector product formula
+            for (size_t j = 0; j < N; ++j) {
+                d_scores_row[j] = scores_row[j] * (d_attn_row[j] - dot_product);
+            }
+        }
+
+        for (size_t i = 0; i < d_Scores.data.size(); ++i) {
+            d_Scores.data[i] *= scale;
+        }
+
+        Tensor d_Q = matmul(d_Scores, K); // S, d)
+        Tensor d_K = matmul(d_Scores, Q, true); // (N, d)
+
+        Tensor d_W_v = matmul(X_mmwave, d_V, true); // (d, d)
+        Tensor d_W_k = matmul(X_mmwave, d_K, true); // (d, d)
+        Tensor d_W_q = matmul(Q_base, d_Q, true); // (d, d)
+
+        Tensor d_Q_base = matmul(d_Q, W_q, false, true); // (S, d)
+        Tensor d_W_fuse = matmul(X_spatial, d_Q_base, true); // (2d, d)
+
         // --- OPTIMIZER STEP ---
         // ... (Update W_fuse, W_q, W_k, W_v using learning_rate) ...
+
+        for (int i = 0; i < W_v.data.size(); i++) {
+            W_v.data[i] -= learning_rate * d_W_v.data[i];
+            W_k.data[i] -= learning_rate * d_W_k.data[i];
+            W_q.data[i] -= learning_rate * d_W_q.data[i];
+        }
+
+        for (int i = 0; i < W_fuse.data.size(); i++) {
+            W_fuse.data[i] -= learning_rate * d_W_fuse.data[i];
+        }
     }
 
     return 0;
